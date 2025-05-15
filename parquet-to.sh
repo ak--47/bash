@@ -1,204 +1,178 @@
 #!/usr/bin/env bash
 
 # parquet-to.sh - Convert Parquet files to NDJSON, Parquet, or CSV using DuckDB
-# Usage: ./parquet-to.sh <input_path> [max_parallel_jobs] [-s|--single-file [output_filename]] [-f|--format <ndjson|parquet|csv>]
+# Usage: ./parquet-to.sh <input_path> [max_parallel_jobs] \
+#   [-s|--single-file [output_filename]] \
+#   [-f|--format <ndjson|parquet|csv>] \
+#   [-c|--cols <column1,column2,...>]
 
 set -euo pipefail
 
-# Check if DuckDB is installed
+### 1) Preconditions
 if ! command -v duckdb &> /dev/null; then
-    echo "Error: duckdb is not installed. Please install it first."
-    echo "Visit https://duckdb.org/docs/installation/ for installation instructions."
-    exit 1
+  echo "Error: duckdb not installed. See https://duckdb.org/docs/installation/" >&2
+  exit 1
 fi
 
-# Defaults
+### 2) Defaults
 MAX_PARALLEL_JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 SINGLE_FILE=false
 OUTPUT_FILENAME=""
 FORMAT="ndjson"
+COLUMNS="*"        # default = all columns
 
 print_help() {
-    cat <<EOF
-Usage: $0 <input_path> [max_parallel_jobs] [-s|--single-file [output_filename]] [-f|--format <ndjson|parquet|csv>]
+  cat <<EOF
+Usage: $0 <input_path> [max_parallel_jobs] [-s|--single-file [output_filename]] \
+[-f|--format <ndjson|parquet|csv>] [-c|--cols <col1,col2,...>]
 
-  <input_path>                Path to a single Parquet file or directory containing Parquet files
-  [max_parallel_jobs]         Optional - Maximum number of parallel jobs (default: CPU cores)
-  -s, --single-file           Optional - Combine all output into a single file
-     [output_filename]        Optional - Name for combined output (default: based on input)
-  -f, --format <ndjson|parquet|csv>
-                              Optional - Output format (default: ndjson)
+  <input_path>          Path to a Parquet file or directory
+  [max_parallel_jobs]   Parallel jobs when not single-file
+  -s, --single-file     Merge into one output file
+     [output_filename]  Optional: name for merged file
+  -f, --format          ndjson (default) | parquet | csv
+  -c, --cols            Comma-separated list of columns (default=all)
 
 Examples:
-  # Convert a single Parquet to NDJSON
-  ./parquet-to.sh data/file.parquet
+  # Single-file parquet → NDJSON
+  $0 data/file.parquet
 
-  # Convert entire directory with 8 jobs into CSV
-  ./parquet-to.sh data/ 8 -f csv
+  # Directory → CSV in 8 jobs
+  $0 data/ 8 -f csv
 
-  # Combine directory into one Parquet file
-  ./parquet-to.sh data/ -s combined.parquet -f parquet
+  # Directory → one Parquet
+  $0 data/ -s combined.parquet -f parquet
+
+  # Only two columns
+  $0 data/file.parquet -c id,name
 EOF
 }
 
-# Parse flags
+### 3) Parse flags
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -s|--single-file)
-            SINGLE_FILE=true
-            shift
-            if [[ $# -gt 0 && ! $1 =~ ^- ]]; then
-                OUTPUT_FILENAME="$1"
-                shift
-            fi
-            ;;
-        -f|--format)
-            if [[ $# -lt 2 ]]; then
-                echo "Error: --format requires an argument."
-                exit 1
-            fi
-            FORMAT="$2"
-            shift 2
-            ;;
-        -h|--help)
-            print_help
-            exit 0
-            ;;
-        *)
-            POSITIONAL+=("$1")
-            shift
-            ;;
-    esac
+  case $1 in
+    -s|--single-file)
+      SINGLE_FILE=true; shift
+      if [[ $# -gt 0 && ! $1 =~ ^- ]]; then
+        OUTPUT_FILENAME="$1"; shift
+      fi
+      ;;
+    -f|--format)
+      [[ $# -ge 2 ]] || { echo "Error: --format needs an argument"; exit 1; }
+      FORMAT="$2"; shift 2
+      ;;
+    -c|--cols)
+      [[ $# -ge 2 ]] || { echo "Error: --cols needs an argument"; exit 1; }
+      # build a quoted list: "col1","col2",...
+      COLUMNS=$(echo "$2" \
+        | tr ',' '\n' \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        | awk '{ printf "\"%s\",", $0 }' \
+        | sed 's/,$//')
+      shift 2
+      ;;
+    -h|--help)
+      print_help; exit 0
+      ;;
+    *)
+      POSITIONAL+=("$1"); shift
+      ;;
+  esac
 done
-
-# Restore positional args
 set -- "${POSITIONAL[@]}"
 
-# Validate args
-if [ $# -lt 1 ]; then
-    echo "Error: Missing <input_path>"
-    print_help
-    exit 1
-fi
+### 4) Validate positional args
+[[ $# -ge 1 ]] || { echo "Error: Missing <input_path>"; print_help; exit 1; }
 INPUT_PATH="$1"
-
-if [ $# -ge 2 ] && [[ "${2}" =~ ^[0-9]+$ ]]; then
-    MAX_PARALLEL_JOBS="$2"
+if [[ $# -ge 2 && $2 =~ ^[0-9]+$ ]]; then
+  MAX_PARALLEL_JOBS="$2"
 fi
 
-# Validate format
+### 5) Pick format
 case "$FORMAT" in
-    ndjson)
-        EXT="ndjson"
-        COPY_OPTS="FORMAT JSON"
-        ;;
-    parquet)
-        EXT="parquet"
-        COPY_OPTS="FORMAT PARQUET"
-        ;;
-    csv)
-        EXT="csv"
-        COPY_OPTS="FORMAT CSV, HEADER"
-        ;;
-    *)
-        echo "Error: Unsupported format '$FORMAT'. Choose ndjson, parquet, or csv."
-        exit 1
-        ;;
+  ndjson)  EXT="ndjson";  COPY_OPTS="FORMAT JSON"      ;;
+  parquet) EXT="parquet"; COPY_OPTS="FORMAT PARQUET"   ;;
+  csv)     EXT="csv";     COPY_OPTS="FORMAT CSV, HEADER";;
+  *)
+    echo "Error: --format must be ndjson, parquet, or csv"; exit 1
+    ;;
 esac
 
-# Export so child xargs/bash -c sees them
-export EXT COPY_OPTS
+export EXT COPY_OPTS COLUMNS
 
-echo "🚀 Converting with format=$FORMAT, max_parallel_jobs=$MAX_PARALLEL_JOBS, single_file=$SINGLE_FILE"
+echo "🚀 format=$FORMAT  cols=${COLUMNS:-*}  parallel=$MAX_PARALLEL_JOBS  single_file=$SINGLE_FILE"
 
-# Determine default output filename for single-file mode
-if [ "$SINGLE_FILE" = true ] && [ -z "$OUTPUT_FILENAME" ]; then
-    if [ -d "$INPUT_PATH" ]; then
-        OUTPUT_FILENAME="$(basename "$INPUT_PATH").$EXT"
-    else
-        OUTPUT_FILENAME="$(basename "${INPUT_PATH%.*}").$EXT"
-    fi
+### 6) Default output filename for single-file
+if $SINGLE_FILE && [[ -z "$OUTPUT_FILENAME" ]]; then
+  if [[ -d "$INPUT_PATH" ]]; then
+    DIR="${INPUT_PATH%/}"
+    OUTPUT_FILENAME="$(basename "$DIR").$EXT"
+  else
+    OUTPUT_FILENAME="$(basename "${INPUT_PATH%.*}").$EXT"
+  fi
 fi
 
-# Prepare temp directory if needed (for ndjson/csv)
-if [ "$SINGLE_FILE" = true ] && [ "$FORMAT" != "parquet" ]; then
-    TEMP_DIR="./tmp"
-    mkdir -p "$TEMP_DIR"
-    trap 'rm -rf "$TEMP_DIR"' EXIT
-fi
-
-# Function to convert a single Parquet file
-convert_file() {
-    local infile="$1"
-    local single="$2"
-    local tmpdir="$3"
-    local base="$(basename "${infile%.*}")"
-
-    if [ "$single" = false ]; then
-        local out="${infile%.*}.$EXT"
-        echo "Converting $infile → $out"
-        duckdb -c "COPY (SELECT * FROM read_parquet('$infile')) TO '$out' ($COPY_OPTS);"
-        echo "✅ $out"
-    else
-        local tmpout="$tmpdir/${base}_temp.$EXT"
-        echo "Processing $infile → $tmpout"
-        duckdb -c "COPY (SELECT * FROM read_parquet('$infile')) TO '$tmpout' ($COPY_OPTS);"
-    fi
+### 7) Build a SELECT clause
+select_clause() {
+  # if user asked for *, use *
+  [[ "$COLUMNS" == "*" ]] && { echo "*"; return; }
+  # otherwise COLUMNS is already "\"col1\",\"col2\""
+  echo "$COLUMNS"
 }
-export -f convert_file
 
-# Main processing
-if [ -d "$INPUT_PATH" ]; then
-    echo "Scanning directory: $INPUT_PATH"
-    mapfile -t files < <(find "$INPUT_PATH" -type f -name "*.parquet")
-    if [ ${#files[@]} -eq 0 ]; then
-        echo "No Parquet files found in $INPUT_PATH"
-        exit 1
-    fi
+### 8) Per-file converter (when NOT single-file)
+convert_file() {
+  local infile="$1"
+  local sel; sel=$(select_clause)
+  local out="${infile%.*}.$EXT"
+  echo "Converting $infile → $out"
+  duckdb -c "COPY (SELECT $sel FROM read_parquet('$infile')) TO '$out' ($COPY_OPTS);"
+  echo "✅ $out"
+}
+export -f convert_file select_clause
 
-    if [ "$SINGLE_FILE" = true ]; then
-        echo "Combining into single output: $OUTPUT_FILENAME"
+### 9) Main logic
+if [[ -d "$INPUT_PATH" ]]; then
+  # directory mode
+  mapfile -t files < <(find "$INPUT_PATH" -type f -name '*.parquet')
+  [[ ${#files[@]} -gt 0 ]] || { echo "No Parquet files found in $INPUT_PATH"; exit 1; }
 
-        if [ "$FORMAT" = "parquet" ]; then
-            # Build SQL array literal of file paths
-            SQL_PATHS=$(printf "'%s'," "${files[@]}")
-            SQL_PATHS=${SQL_PATHS%,}
+  if $SINGLE_FILE; then
+    # merge all via a single DuckDB command
+    sel=$(select_clause)
+    # build ARRAY literal of parquet files
+    SQL_PATHS=$(printf "'%s'," "${files[@]}")
+    SQL_PATHS=${SQL_PATHS%,}
+    echo "Merging ${#files[@]} files → $OUTPUT_FILENAME"
+    duckdb -c "COPY (
+      SELECT $sel
+      FROM read_parquet(ARRAY[${SQL_PATHS}])
+    ) TO '$OUTPUT_FILENAME' ($COPY_OPTS);"
+    echo "✅ Merged → $OUTPUT_FILENAME"
+  else
+    # parallel per-file
+    printf '%s\n' "${files[@]}" \
+      | xargs -n1 -P "$MAX_PARALLEL_JOBS" \
+          bash -c 'convert_file "$0"' 
+    echo "🎉 All individual conversions complete."
+  fi
 
-            # Let DuckDB merge them in one go
-            duckdb -c "COPY (
-  SELECT * 
-  FROM read_parquet(ARRAY[${SQL_PATHS}])
-) TO '$OUTPUT_FILENAME' (FORMAT PARQUET);"
+elif [[ -f "$INPUT_PATH" && "$INPUT_PATH" == *.parquet ]]; then
+  # single-file Parquet input
+  if $SINGLE_FILE; then
+    # direct copy
+    sel=$(select_clause)
+    echo "Converting single file → $OUTPUT_FILENAME"
+    duckdb -c "COPY (SELECT $sel FROM read_parquet('$INPUT_PATH')) TO '$OUTPUT_FILENAME' ($COPY_OPTS);"
+    echo "✅ $OUTPUT_FILENAME"
+  else
+    convert_file "$INPUT_PATH"
+    echo "🎉 Conversion complete."
+  fi
 
-            echo "✅ Merged Parquet → $OUTPUT_FILENAME"
-        else
-            # Convert each to tmp and cat together
-            printf '%s\n' "${files[@]}" \
-              | xargs -n1 -P "$MAX_PARALLEL_JOBS" -I{} bash -c 'convert_file "$@"' _ {} true "$TEMP_DIR"
-            cat "$TEMP_DIR"/*."$EXT" > "$OUTPUT_FILENAME"
-            echo "✅ Combined → $OUTPUT_FILENAME"
-        fi
-    else
-        # Individual conversion
-        printf '%s\n' "${files[@]}" \
-          | xargs -n1 -P "$MAX_PARALLEL_JOBS" -I{} bash -c 'convert_file "$@"' _ {} false ""
-    fi
-
-    echo "🎉 Directory conversion complete."
-elif [ -f "$INPUT_PATH" ] && [[ "$INPUT_PATH" == *.parquet ]]; then
-    echo "Single file mode: $INPUT_PATH"
-    if [ "$SINGLE_FILE" = true ]; then
-        echo "Converting → $OUTPUT_FILENAME"
-        duckdb -c "COPY (SELECT * FROM read_parquet('$INPUT_PATH')) TO '$OUTPUT_FILENAME' ($COPY_OPTS);"
-        echo "✅ $OUTPUT_FILENAME"
-    else
-        convert_file "$INPUT_PATH" false ""
-    fi
-    echo "🎉 File conversion complete."
 else
-    echo "Error: '$INPUT_PATH' is not a Parquet file or directory"
-    exit 1
+  echo "Error: '$INPUT_PATH' is not a Parquet file or directory"; exit 1
 fi
 
-echo "💯 All done!"
+echo "💯 Done!"
