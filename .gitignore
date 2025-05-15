@@ -1,0 +1,11 @@
+# ignore everything except .sh files
+# Ignore everything
+*
+
+# Don't ignore directories so Git can traverse them.
+!*/
+
+# Unignore shell script files
+!*.sh
+
+!.gitignore
